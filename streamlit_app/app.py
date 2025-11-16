@@ -12,6 +12,7 @@ initialize_vertex_ai = None
 create_or_get_corpus = None
 upload_pdf_to_corpus = None
 list_corpus_files = None
+using_local_helpers = False
 
 try:
     from rag.shared_libraries.prepare_corpus_and_data import (
@@ -26,15 +27,40 @@ try:
     list_corpus_files = _list_files
     init_error = None
 except Exception as e:
-    init_error = e
+    try:
+        from local_rag_backend import (
+            initialize_vertex_ai as _local_init,
+            create_or_get_corpus as _local_create,
+            upload_pdf_to_corpus as _local_upload,
+            list_corpus_files as _local_list,
+        )
+
+        initialize_vertex_ai = _local_init
+        create_or_get_corpus = _local_create
+        upload_pdf_to_corpus = _local_upload
+        list_corpus_files = _local_list
+        init_error = None
+        using_local_helpers = True
+    except Exception as local_error:
+        init_error = RuntimeError(f"{e}; fallback error: {local_error}")
 
 agent = None
 agent_import_error = None
+using_local_agent = False
 try:
     from rag.main import agent as _agent
     agent = _agent
 except Exception as e:
-    agent_import_error = e
+    try:
+        from local_rag_backend import build_local_agent
+
+        agent = build_local_agent()
+        using_local_agent = True
+        agent_import_error = None
+    except Exception as agent_fallback_error:
+        agent_import_error = RuntimeError(
+            f"{e}; fallback error: {agent_fallback_error}"
+        )
 
 REMOTE_RAG_ENDPOINT_URL = os.getenv("REMOTE_RAG_ENDPOINT_URL", "").strip()
 
@@ -131,6 +157,22 @@ if init_error:
     st.error(
         "Could not import RAG helpers from rag.shared_libraries.prepare_corpus_and_data.py.\n\n"
         f"Error: {init_error}"
+    )
+elif using_local_helpers:
+    st.info(
+        "ADK RAG helpers were not found – using the built-in local corpus backend "
+        "for uploads and metadata management."
+    )
+
+if agent_import_error:
+    st.warning(
+        "The ADK agent is not available. Configure the Vertex AI sample code or set "
+        "REMOTE_RAG_ENDPOINT_URL to use an external backend."
+    )
+elif using_local_agent:
+    st.info(
+        "Using the local keyword-search agent. Add the official ADK agent for full "
+        "RAG capabilities."
     )
 
 tabs = st.tabs(
