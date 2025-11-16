@@ -7,3 +7,4 @@ streamlit
 pydantic
 pypdf
 adk
+google-genai

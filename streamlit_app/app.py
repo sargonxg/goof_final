@@ -1,311 +1,299 @@
 import os
 import tempfile
-from typing import Any
+import time
+from typing import Dict, List, Optional
 
 import streamlit as st
 from dotenv import load_dotenv
-from pypdf import PdfReader
 
 load_dotenv()
 
-initialize_vertex_ai = None
-create_or_get_corpus = None
-upload_pdf_to_corpus = None
-list_corpus_files = None
-using_local_helpers = False
-
 try:
-    from rag.shared_libraries.prepare_corpus_and_data import (
-        initialize_vertex_ai as _init_va,
-        create_or_get_corpus as _create_corpus,
-        upload_pdf_to_corpus as _upload_pdf,
-        list_corpus_files as _list_files,
-    )
-    initialize_vertex_ai = _init_va
-    create_or_get_corpus = _create_corpus
-    upload_pdf_to_corpus = _upload_pdf
-    list_corpus_files = _list_files
-    init_error = None
-except Exception as e:
-    try:
-        from local_rag_backend import (
-            initialize_vertex_ai as _local_init,
-            create_or_get_corpus as _local_create,
-            upload_pdf_to_corpus as _local_upload,
-            list_corpus_files as _local_list,
-        )
+    from google import genai
+    from google.genai import types
+except Exception as import_error:  # pragma: no cover - surfaced in UI
+    genai = None
+    types = None
+    GENAI_IMPORT_ERROR = import_error
+else:
+    GENAI_IMPORT_ERROR = None
 
-        initialize_vertex_ai = _local_init
-        create_or_get_corpus = _local_create
-        upload_pdf_to_corpus = _local_upload
-        list_corpus_files = _local_list
-        init_error = None
-        using_local_helpers = True
-    except Exception as local_error:
-        init_error = RuntimeError(f"{e}; fallback error: {local_error}")
-
-agent = None
-agent_import_error = None
-using_local_agent = False
-try:
-    from rag.main import agent as _agent
-    agent = _agent
-except Exception as e:
-    try:
-        from local_rag_backend import build_local_agent
-
-        agent = build_local_agent()
-        using_local_agent = True
-        agent_import_error = None
-    except Exception as agent_fallback_error:
-        agent_import_error = RuntimeError(
-            f"{e}; fallback error: {agent_fallback_error}"
-        )
-
-REMOTE_RAG_ENDPOINT_URL = os.getenv("REMOTE_RAG_ENDPOINT_URL", "").strip()
+MAX_PDFS = 10
+DEFAULT_MODEL = "gemini-2.5-flash"
 
 st.set_page_config(
-    page_title="Vertex RAG – Multi‑PDF Uploader & Query",
+    page_title="Gemini File Search RAG",
     layout="wide",
 )
 
 if "logs" not in st.session_state:
     st.session_state["logs"] = []
-if "corpus_files" not in st.session_state:
-    st.session_state["corpus_files"] = []
+if "store_name" not in st.session_state:
+    st.session_state["store_name"] = ""
+if "store_display_name" not in st.session_state:
+    st.session_state["store_display_name"] = ""
+if "upload_history" not in st.session_state:
+    st.session_state["upload_history"] = []
+if "conversation" not in st.session_state:
+    st.session_state["conversation"] = []
 
 
-def log(msg: str) -> None:
-    st.session_state["logs"].append(msg)
+def log(message: str) -> None:
+    """Persist a message into the in-memory log and surface in the UI."""
+    st.session_state["logs"].append(message)
 
 
-def generate_display_name_from_pdf(temp_path: str, original_name: str) -> str:
-    """Open the PDF, read the first page, and derive a short title."""
-    try:
-        reader = PdfReader(temp_path)
-        if not reader.pages:
-            return original_name
-        text = reader.pages[0].extract_text() or ""
-        text = " ".join(text.split())
-        if not text:
-            return original_name
-        snippet = text[:120]
-        snippet = snippet.replace("/", "-").replace("\\", "-").replace("\n", " ")
-        return snippet + ".pdf"
-    except Exception as e:
-        log(f"[rename] Failed to read PDF for {original_name}: {e}")
-        return original_name
+def get_client(api_key: str) -> "genai.Client":
+    if not genai:
+        raise RuntimeError(
+            "google-genai is not installed. Add it to requirements.txt and pip install the package."
+        )
+    if not api_key:
+        raise ValueError("Provide a Gemini API key to continue.")
+    cached_key = st.session_state.get("_genai_cached_key")
+    if cached_key == api_key and st.session_state.get("_genai_client") is not None:
+        return st.session_state["_genai_client"]
+    client = genai.Client(api_key=api_key)
+    st.session_state["_genai_cached_key"] = api_key
+    st.session_state["_genai_client"] = client
+    log("[client] Initialized Gemini client")
+    return client
 
 
-def get_corpus() -> Any:
-    if initialize_vertex_ai is None or create_or_get_corpus is None:
-        return None
-    initialize_vertex_ai()
-    corpus = create_or_get_corpus()
-    return corpus
+def wait_for_operation(client: "genai.Client", operation: any, poll_seconds: float = 2.0) -> any:
+    """Poll the long-running operation until it reports completion."""
+    current_op = operation
+    while getattr(current_op, "done", True) is False:
+        time.sleep(poll_seconds)
+        if hasattr(current_op, "name"):
+            current_op = client.operations.get(name=current_op.name)
+        else:
+            current_op = client.operations.get(current_op)
+    return current_op
 
 
-def refresh_corpus_files(corpus_name: str) -> None:
-    files = []
-    if list_corpus_files is not None:
+def create_file_search_store(client: "genai.Client", display_name: str) -> str:
+    config: Dict[str, str] = {}
+    if display_name:
+        config["display_name"] = display_name
+    store = client.file_search_stores.create(config=config or None)
+    st.session_state["store_name"] = store.name
+    st.session_state["store_display_name"] = getattr(store, "display_name", display_name)
+    log(f"[store] Created file search store {store.name}")
+    return store.name
+
+
+def upload_pdfs(
+    client: "genai.Client",
+    store_name: str,
+    uploaded_files: List["st.runtime.uploaded_file_manager.UploadedFile"],
+) -> None:
+    if not store_name:
+        raise ValueError("Select or create a File Search store first.")
+    if len(uploaded_files) > MAX_PDFS:
+        raise ValueError(f"You can upload at most {MAX_PDFS} PDFs per batch.")
+
+    progress = st.progress(0.0)
+    for index, uploaded_file in enumerate(uploaded_files, start=1):
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_file:
+            tmp_file.write(uploaded_file.getvalue())
+            tmp_path = tmp_file.name
+        log(f"[upload] Sending {uploaded_file.name} to {store_name}")
         try:
-            files = list_corpus_files(corpus_name=corpus_name)
-        except TypeError:
-            files = []
-        except Exception as e:
-            log(f"[corpus] Error listing corpus files: {e}")
-            files = []
-    st.session_state["corpus_files"] = files
+            operation = client.file_search_stores.upload_to_file_search_store(
+                file_search_store_name=store_name,
+                file=tmp_path,
+                config={"display_name": uploaded_file.name},
+            )
+            wait_for_operation(client, operation)
+            st.session_state["upload_history"].insert(
+                0,
+                {
+                    "file": uploaded_file.name,
+                    "store": store_name,
+                    "size_kb": round(uploaded_file.size / 1024, 2),
+                },
+            )
+        finally:
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+        progress.progress(index / len(uploaded_files))
+    log(f"[upload] Uploaded {len(uploaded_files)} files")
 
 
-def display_corpus_stats(files: Any) -> None:
-    st.markdown("### 📊 Corpus statistics")
-    if not files:
-        st.info("No file metadata available from list_corpus_files.")
-        return
-    if isinstance(files, list):
-        st.write(f"**Total documents:** {len(files)}")
-        try:
-            st.dataframe(files)
-        except Exception:
-            st.json(files)
-    else:
-        st.json(files)
-
-
-def query_local_agent(question: str) -> str:
-    if agent is None:
-        raise RuntimeError("Local ADK agent is not available.")
-    result = agent.run(question)
-    return str(result)
-
-
-def query_remote_agent(question: str) -> str:
-    import requests
-    if not REMOTE_RAG_ENDPOINT_URL:
-        raise RuntimeError("REMOTE_RAG_ENDPOINT_URL is not set.")
-    url = REMOTE_RAG_ENDPOINT_URL.rstrip("/") + "/chat"
-    resp = requests.post(url, json={"query": question}, timeout=120)
-    resp.raise_for_status()
-    data = resp.json()
-    return data.get("response", data)
-
-
-st.title("📚 Vertex RAG – Multi‑PDF Uploader & Deep Query")
-
-if init_error:
-    st.error(
-        "Could not import RAG helpers from rag.shared_libraries.prepare_corpus_and_data.py.\n\n"
-        f"Error: {init_error}"
+def run_file_search_query(
+    client: "genai.Client", store_name: str, question: str, model_name: str
+) -> str:
+    if types is None:
+        raise RuntimeError("google-genai types unavailable – reinstall google-genai.")
+    if not store_name:
+        raise ValueError("No File Search store selected.")
+    if not question.strip():
+        raise ValueError("Enter a question to run File Search.")
+    config = types.GenerateContentConfig(
+        tools=[
+            types.Tool(
+                file_search=types.FileSearch(
+                    file_search_store_names=[store_name],
+                )
+            )
+        ]
     )
-elif using_local_helpers:
-    st.info(
-        "ADK RAG helpers were not found – using the built-in local corpus backend "
-        "for uploads and metadata management."
+    response = client.models.generate_content(
+        model=model_name or DEFAULT_MODEL,
+        contents=question,
+        config=config,
     )
+    grounding = []
+    if response.candidates:
+        meta = response.candidates[0].grounding_metadata
+        if meta and getattr(meta, "sources", None):
+            for source in meta.sources:
+                doc = source.get("title") or source.get("uri") or "document"
+                grounding.append(doc)
+    answer_text = response.text
+    st.session_state["conversation"].insert(
+        0,
+        {
+            "question": question,
+            "answer": answer_text,
+            "citations": grounding,
+        },
+    )
+    return answer_text
 
-if agent_import_error:
-    st.warning(
-        "The ADK agent is not available. Configure the Vertex AI sample code or set "
-        "REMOTE_RAG_ENDPOINT_URL to use an external backend."
-    )
-elif using_local_agent:
-    st.info(
-        "Using the local keyword-search agent. Add the official ADK agent for full "
-        "RAG capabilities."
-    )
 
-tabs = st.tabs(
-    [
-        "📂 Upload & Corpus",
-        "💬 Ask Questions",
-        "🛠 Backend Activity",
-        "🏗 Architecture & Models",
-    ]
+st.title("📚 Gemini File Search – Multi PDF RAG")
+st.caption(
+    "Upload up to 10 PDFs, let Gemini File Search index them, and instantly run retrieval‑augmented questions."
 )
 
-with tabs[0]:
-    st.header("Upload PDFs to Vertex RAG Engine")
-    if initialize_vertex_ai is None or create_or_get_corpus is None or upload_pdf_to_corpus is None:
-        st.warning("RAG helpers not available. Ensure ADK RAG sample code is present.")
-    else:
-        corpus = get_corpus()
-        if corpus is None:
-            st.error("Failed to initialize or get corpus.")
-        else:
-            st.success(f"Active corpus: {corpus.name}")
-            st.caption(
-                "Files uploaded here will be added to this corpus. Display names are auto‑generated "
-                "based on the first page of each PDF."
-            )
-            uploaded_files = st.file_uploader(
-                "Upload one or more PDF documents",
-                type=["pdf"],
-                accept_multiple_files=True,
-            )
-            if uploaded_files and st.button("Upload to RAG corpus"):
-                total = len(uploaded_files)
-                progress = st.progress(0)
-                for idx, f in enumerate(uploaded_files, start=1):
-                    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
-                        tmp.write(f.getvalue())
-                        tmp_path = tmp.name
-                    display_name = generate_display_name_from_pdf(tmp_path, f.name)
-                    log(f"[upload] {f.name} -> {display_name} into corpus {corpus.name}")
-                    try:
-                        upload_pdf_to_corpus(
-                            corpus_name=corpus.name,
-                            pdf_path=tmp_path,
-                            display_name=display_name,
-                            description="Uploaded via Streamlit UI",
-                        )
-                    except Exception as e:
-                        log(f"[upload] Error uploading {f.name}: {e}")
-                    finally:
-                        try:
-                            os.remove(tmp_path)
-                        except OSError:
-                            pass
-                    progress.progress(idx / total)
-                st.success(f"Uploaded {total} files.")
-                refresh_corpus_files(corpus.name)
-
-            st.divider()
-            st.subheader("Current corpus contents")
-            files = st.session_state.get("corpus_files", [])
-            if st.button("🔄 Refresh corpus file list"):
-                refresh_corpus_files(corpus.name)
-                files = st.session_state.get("corpus_files", [])
-            display_corpus_stats(files)
-
-with tabs[1]:
-    st.header("Ask deep, complex questions about your documents")
-    st.write(
-        "Enter long, detailed queries. The agent will use retrieval‑augmented generation "
-        "over your RAG corpus (via the ADK agent or a remote RAG endpoint)."
+if GENAI_IMPORT_ERROR:
+    st.error(
+        "google-genai could not be imported. Install it and restart the app.\n\n"
+        f"Details: {GENAI_IMPORT_ERROR}"
     )
-    if REMOTE_RAG_ENDPOINT_URL:
-        engine_choice = st.radio(
-            "Which backend to use?",
-            ["Local ADK agent", "Remote RAG endpoint"],
+
+with st.sidebar:
+    st.header("Configuration")
+    api_key = st.text_input(
+        "Gemini API key",
+        value=os.getenv("GOOGLE_API_KEY", os.getenv("GEMINI_API_KEY", "")),
+        type="password",
+        help="Create one at https://aistudio.google.com/app/apikey",
+    )
+    st.session_state["store_name"] = st.text_input(
+        "Active File Search store name",
+        value=st.session_state.get("store_name", ""),
+        help="Paste an existing store name or create a new one below.",
+    )
+    with st.form("create_store_form"):
+        st.write("Create a new File Search store")
+        new_display_name = st.text_input(
+            "Store display name",
+            value=st.session_state.get("store_display_name", ""),
         )
-    else:
-        engine_choice = "Local ADK agent"
-        st.info("REMOTE_RAG_ENDPOINT_URL is not set; using local ADK agent if available.")
+        submitted = st.form_submit_button("Create store", use_container_width=True)
+        if submitted:
+            try:
+                client = get_client(api_key)
+                store_name = create_file_search_store(client, new_display_name)
+                st.success(f"Created {store_name}")
+            except Exception as exc:
+                st.error(f"Unable to create store: {exc}")
+
+upload_tab, query_tab, activity_tab = st.tabs([
+    "1️⃣ Upload PDFs",
+    "2️⃣ Ask questions",
+    "3️⃣ Activity & citations",
+])
+
+with upload_tab:
+    st.subheader("Upload and index PDFs")
+    st.info(
+        "Gemini File Search stores chunks, embeds, and indexes each document. Limit: 100 MB per PDF and 10 PDFs per upload batch."
+    )
+    uploaded_files = st.file_uploader(
+        "Drop your PDF files",
+        type=["pdf"],
+        accept_multiple_files=True,
+        help="Select up to 10 PDFs at a time.",
+    )
+    if uploaded_files:
+        if len(uploaded_files) > MAX_PDFS:
+            st.error(f"You selected {len(uploaded_files)} files – limit is {MAX_PDFS} per batch.")
+        if st.button("Upload to File Search", use_container_width=True):
+            try:
+                client = get_client(api_key)
+                with st.spinner("Uploading and indexing PDFs…"):
+                    upload_pdfs(client, st.session_state.get("store_name", ""), uploaded_files)
+                st.success("Upload complete. You can now query these documents.")
+            except Exception as exc:
+                st.error(f"Upload failed: {exc}")
+                log(f"[error] upload failed {exc}")
+
+    if st.session_state.get("upload_history"):
+        st.markdown("### Recent uploads")
+        st.dataframe(st.session_state["upload_history"][:20])
+
+with query_tab:
+    st.subheader("Ask Gemini with File Search context")
+    model_choice = st.selectbox(
+        "Model",
+        options=["gemini-2.5-flash", "gemini-2.5-pro"],
+        index=0,
+        help="Both models support File Search."
+    )
     question = st.text_area(
         "Your question",
-        height=150,
-        placeholder="Ask anything that requires deep reasoning over your uploaded PDFs...",
+        height=180,
+        placeholder="Ex: Summarize the risk sections across these PDFs…",
     )
-    if st.button("Run query"):
-        if not question.strip():
-            st.warning("Please enter a question.")
-        else:
-            try:
-                with st.spinner("Querying RAG backend…"):
-                    if engine_choice == "Remote RAG endpoint" and REMOTE_RAG_ENDPOINT_URL:
-                        answer = query_remote_agent(question)
-                        log(f"[query/remote] {question}")
-                    else:
-                        if agent is None:
-                            raise RuntimeError(
-                                "Local ADK agent is not available and no remote endpoint is configured."
-                            )
-                        answer = query_local_agent(question)
-                        log(f"[query/local] {question}")
-                st.markdown("### Answer")
-                st.write(answer)
-            except Exception as e:
-                st.error(f"Error during query: {e}")
-                log(f"[query/error] {e}")
+    if st.button("Run File Search query", use_container_width=True):
+        try:
+            client = get_client(api_key)
+            with st.spinner("Grounding response with your PDFs…"):
+                answer = run_file_search_query(
+                    client,
+                    st.session_state.get("store_name", ""),
+                    question,
+                    model_choice,
+                )
+            st.markdown("### Answer")
+            st.write(answer)
+            if st.session_state["conversation"][0]["citations"]:
+                st.caption(
+                    "Citations: " + ", ".join(st.session_state["conversation"][0]["citations"])
+                )
+        except Exception as exc:
+            st.error(f"Query failed: {exc}")
+            log(f"[error] query failed {exc}")
 
-with tabs[2]:
-    st.header("Backend activity & logs")
-    st.write(
-        "This panel shows a simple in‑memory log of key events: initialization, uploads, "
-        "corpus operations, and queries."
-    )
+    if st.session_state.get("conversation"):
+        st.markdown("### Conversation history")
+        for turn in st.session_state["conversation"][:5]:
+            with st.expander(turn["question"][:80] + ("…" if len(turn["question"]) > 80 else "")):
+                st.markdown(f"**Question**: {turn['question']}")
+                st.markdown(f"**Answer**: {turn['answer']}")
+                if turn["citations"]:
+                    st.caption("Citations: " + ", ".join(turn["citations"]))
+
+with activity_tab:
+    st.subheader("Activity log")
+    st.caption("All significant actions recorded for easy debugging.")
     if st.button("Clear logs"):
         st.session_state["logs"] = []
-    logs = st.session_state.get("logs", [])
-    if logs:
-        st.text_area("Log output", value="\n".join(logs), height=400)
+    if st.session_state["logs"]:
+        st.text_area("Logs", value="\n".join(st.session_state["logs"]), height=300)
     else:
-        st.info("No log entries yet.")
+        st.info("No logs yet – upload a PDF or run a query to get started.")
 
-with tabs[3]:
-    st.header("Architecture & models in use")
-    st.markdown(
-        """
-This app sits on top of your existing Vertex AI RAG / ADK agent infrastructure.
-
-**Components:**
-1. Streamlit UI (this app)
-2. RAG helpers from `rag.shared_libraries.prepare_corpus_and_data`
-3. Vertex AI RAG Engine corpus
-4. ADK agent (`rag.main.agent`) using Gemini/Vertex models and RAG tools
-5. Optional remote RAG endpoint (`REMOTE_RAG_ENDPOINT_URL`)
-
-You can customize this panel to describe your exact models, corpora, and tools.
-"""
-    )
+    if st.session_state.get("conversation"):
+        st.markdown("### Latest citations")
+        latest = st.session_state["conversation"][0]
+        if latest["citations"]:
+            st.write(latest["citations"])
+        else:
+            st.write("No citations returned yet.")
